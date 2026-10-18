@@ -1,0 +1,744 @@
+# HealthTech Appointment Booking Platform
+
+A microservice-based appointment booking platform built as a **distributed systems and event-driven architecture project
+**.
+
+The focus is not only building services, but demonstrating how system behavior changes under different architectural
+constraints: separating concerns early (service boundaries, async messaging, data ownership) and re-integrating them as
+domain complexity grows (authentication, cross-service validation, business rules).
+
+The work is organized in phases:
+
+* **Phase 1:** Distributed system fundamentals (service boundaries, async communication, data ownership)
+* **Phase 2:** Domain complexity (patients, doctors, authentication, availability, booking rules, cross-service
+  validation)
+* **Phase 3 (in progress):** Production-grade concerns (observability, reliability, service discovery, AI-assisted
+  workflows); see Project Phases for what is done
+
+Phase 2 is complete: end-to-end booking with JWT-secured, race-safe reservations and RFC 9457 error
+handling. Phase 3 is in progress.
+
+---
+
+## Tech Stack
+
+Java 21 · Spring Boot 3 · Apache Kafka · PostgreSQL · Spring Cloud Gateway (MVC) · Spring Security (OAuth2 Resource
+Server) · MapStruct · JWT (RS256) · springdoc-openapi (Swagger UI) · Docker · React (Vite, TypeScript)
+
+---
+
+## Architecture Overview
+
+```mermaid
+flowchart TB
+    browser(["Browser · React SPA"])
+    gw["api-gateway<br/>routing · JWT edge check"]
+    patient["patient-service<br/>accounts · PATIENT tokens"]
+    doctor["doctor-service<br/>profiles · DOCTOR tokens"]
+    appt["appointment-service<br/>booking · availability"]
+    kafka{{"Apache Kafka"}}
+    notif["notification-service<br/>notification records"]
+
+    browser -->|"REST"| gw
+    gw --> patient & doctor & appt
+    patient -.->|"patient.registered"| kafka
+    doctor -.->|"doctor.registered"| kafka
+    appt <-.->|"publishes appointment.*<br/>consumes *.registered"| kafka
+    kafka -.->|"appointment.*"| notif
+```
+
+Solid arrows are HTTP; dotted arrows are Kafka events, written through each producer's transactional outbox (see
+Reliability). Each service owns its own PostgreSQL database (ADR-003). Appointment Service consumes
+`patient.registered` and `doctor.registered` to build a local read-model (see Cross-Service Validation below), and
+publishes booking events that Notification Service consumes. The frontend calls only the gateway, and no service
+calls another directly.
+
+More diagrams (event flow and outbox, booking sequence, key distribution, gateway routes) are in
+[`docs/architecture/architecture.md`](docs/architecture/architecture.md).
+
+---
+
+## Services
+
+| Service                | Port | Responsibility                                                                                                                                                              |
+|------------------------|------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `api-gateway`          | 8080 | Single entry point for all client traffic; routes each path prefix to the owning service                                                                                    |
+| `appointment-service`  | 8081 | Booking, changing, cancellation, availability/slot computation, read-model of valid patients/doctors, JWT validation, publishes domain events                                         |
+| `notification-service` | 8082 | Consumes appointment events from Kafka and persists notification records independently                                                                                      |
+| `patient-service`      | 8083 | Patient registration, login, JWT issuance (RS256), profile management                                                                                                       |
+| `doctor-service`       | 8084 | Doctor self-registration, login, JWT issuance (RS256), specialty and language filtering, opening hours, registration event publishing                                       |
+| `frontend`             | 5173 | React (Vite, TypeScript) client. Talks to every service exclusively through the API Gateway. Containerized (nginx) in `docker-compose.yml` on `localhost:5173`; see Step 6 |
+
+---
+
+## Kafka Event Model
+
+| Event                   | Producer            | Consumer(s)                      |
+|-------------------------|---------------------|----------------------------------|
+| `patient.registered`    | patient-service     | appointment-service (read-model) |
+| `doctor.registered`     | doctor-service      | appointment-service (read-model) |
+| `appointment.booked`    | appointment-service | notification-service             |
+| `appointment.cancelled` | appointment-service | notification-service             |
+| `appointment.changed`   | appointment-service | notification-service             |
+
+Kafka was chosen over synchronous REST for temporal decoupling: a consumer does not need to be available when an event
+is produced. Events are retained in the log and consumed when the service is ready.
+
+---
+
+## Authentication and Authorization
+
+Authentication uses **JWT with RS256** (asymmetric signing), per [ADR-004](docs/adr/ADR-004-JWT-Authentication.md).
+
+* Patient Service issues PATIENT tokens (signs with the private key at registration and login).
+* Doctor Service issues DOCTOR tokens (signs with the same shared private key at self-registration and login).
+* The public key is distributed to services that validate tokens. Appointment Service validates tokens with the same
+  public key; it never holds the private key and cannot mint tokens.
+* Validation follows a hybrid, zero-trust model: services validate tokens independently (the authoritative boundary).
+  The API Gateway additionally validates the token's signature and expiry at the edge (no role check) and rejects
+  unauthenticated traffic on protected paths; see ADR-004.
+* Tokens carry minimal claims: `sub` (the subject's id: the patient id in a PATIENT token, the doctor id in a DOCTOR
+  token), `role`, and `exp`.
+
+**Identity is derived from the token, not the request body.** Booking takes the patient id from the token subject (
+`sub`), so a caller cannot book on behalf of another user by supplying a different id. Changing and cancelling enforce
+ownership and require a PATIENT token, consistent with booking: a patient can only change or cancel their own
+appointment. Requests with
+the wrong token type or attempts to act on another user's resource are rejected with `403`.
+
+Public (no token required): patient and doctor registration/login, doctor browsing, specialty listing, and
+availability. Booking, changing and cancellation require a valid patient token. The Swagger UI and OpenAPI spec endpoints
+(`/swagger-ui.html`, `/swagger-ui/**`, `/v3/api-docs/**`, and the gateway's `/docs/*/v3/api-docs`) are also public.
+
+---
+
+## Booking and Availability
+
+Availability is modeled as a **first-class resource** (`GET /api/availability`), owned by Appointment Service because it
+is computed from appointment data plus doctor opening hours.
+
+* Slots are a fixed 30-minute grid generated from a doctor's opening hours for the requested day, minus already-taken (
+  non-cancelled) appointments, minus slots that already started today. A date before today has no slots.
+* **Double-booking is prevented at the database level, race-safe.** A Postgres **partial unique index** on
+  `(doctor_id, date_time) WHERE status <> 'CANCELLED'` makes concurrent double-bookings impossible: the database rejects
+  the second insert atomically, which is mapped to `409`. This avoids the check-then-insert race that application-level
+  checks suffer from.
+* Cancellation is a **soft delete** (status set to `CANCELLED`), so the audit trail is preserved and the slot becomes
+  bookable again. The partial index is what allows a cancelled slot to be re-booked without losing the record.
+* **Cancel is idempotent.** Cancelling an already-cancelled appointment returns `200` with the current state and
+  publishes no new `appointment.cancelled` event. Concurrent cancels of one appointment are serialized by a row lock. If
+  another request holds the row for more than 3 seconds, the endpoint returns `503` (`Appointment Busy`) with
+  `Retry-After: 1`; the cancel can be retried safely.
+* **Changing an appointment** is `PATCH /api/appointments/{id}` with a partial body: any of `type`, `dateTime` and
+  `notes` (at least one; an empty `notes` string clears the notes). It is allowed up to
+  `appointment.change.min-notice-hours` (default 48) before the appointment's current start; inside that window it
+  returns `409` (`Change Window Closed`). The appointment keeps its doctor and patient. A new `dateTime` must pass the
+  same rules as a booking (slot grid, the doctor's opening hours, not in the past) and be free; the new time itself only
+  has to be in the future, not 48 hours away. A cancelled appointment returns `409` (`Appointment Not Changeable`).
+  Like cancel it takes the row lock, so it cannot race a cancel, and returns the same `503` when the lock is not
+  granted within 3 seconds. When `type` or `dateTime` actually changes it publishes `appointment.changed`; notes-only
+  and no-op changes publish nothing.
+  The frontend does not open the change form for an appointment starting in less than 48 hours: it shows a pop-up that
+  it can no longer be changed (it also shows it when the server answers `Change Window Closed`).
+
+---
+
+## Cross-Service Validation (Read-Model)
+
+Per [ADR-005](docs/adr/ADR-005-cross-service-validation.md), Appointment Service validates that a patient and doctor
+exist before booking, **without** synchronous calls to Patient or Doctor Service. It consumes `patient.registered` and
+`doctor.registered` into a local read-model (`ValidPatient`, `ValidDoctor`, including the doctor's opening hours), and
+validates bookings against that projection. This preserves the async decoupling of ADR-002 while still enforcing
+existence.
+
+The consumer is idempotent (keyed on the domain id) and hydrates from the beginning of the topic on first run, so it
+reconstructs state that predates it.
+
+---
+
+## Error Handling
+
+All services return **RFC 9457 problem+json** error responses via a per-service `@RestControllerAdvice`:
+
+| Condition                                                       | Status                                                          |
+|-----------------------------------------------------------------|-----------------------------------------------------------------|
+| Unknown patient/doctor, appointment/specialty not found         | `404`                                                           |
+| Validation failure (with field-level detail), malformed request | `400`                                                           |
+| Invalid credentials                                             | `401` (no/invalid token)                                        |
+| Wrong token type, or acting on another user's resource          | `403`                                                           |
+| Duplicate username/email, double-booking                        | `409`                                                           |
+| Unexpected error                                                | `500` (generic message; cause logged server-side, never leaked) |
+
+Duplicate detection (username, email, double-booking) is enforced by database unique constraints and translated to
+`409`, rather than by race-prone pre-checks.
+
+---
+
+## Observability
+
+Every service, including the gateway, generates or propagates a correlation ID via a `CorrelationIdFilter` and logs
+it through MDC (`%5p [%X{correlationId}]` in the log pattern). The gateway resolves or generates the id first, then
+overwrites the outbound header before proxying, so the same id threads through the gateway and the service handling
+the request.
+
+The id also crosses the Kafka boundary: producers attach it to the message as an `X-Correlation-Id` header, and
+consumers read it back into their own MDC before processing. Because cross-service work here is asynchronous rather
+than synchronous ([ADR-005](docs/adr/ADR-005-cross-service-validation.md)), this is the hop that matters: a single
+grep for one id relates a registration request to the read-model projection it triggered in another service. Events
+published outside a request context, such as the demo seeder, fall back to a generated id rather than failing.
+See [ADR-007](docs/adr/ADR-007-correlation-id-propagation.md) for the trade-off against distributed tracing.
+
+Metrics, distributed tracing (spans), and consumer-side retries and a dead-letter topic are not implemented yet and
+remain Phase 3 work; see Reliability and Current Limitations.
+
+---
+
+## Reliability
+
+**Transactional outbox (implemented).** `patient-service`, `doctor-service` and `appointment-service` do not call Kafka
+from the request path. `DomainEventPublisher` writes each event to an `outbox` table in the same database transaction
+as the change it describes, so the event exists if and only if that change committed. A scheduled `OutboxRelay`
+(every second, batches of 100) claims unpublished rows with `FOR UPDATE SKIP LOCKED`, sends them to Kafka and marks
+them published; a row whose send fails stays unpublished and is retried on the next poll, with no retry limit. The
+correlation id is stored on the row and re-attached as the message header. Published rows are pruned after seven days;
+unpublished rows are never pruned. Delivery is therefore at-least-once: if the relay crashes after a send but before
+the row is marked, the event is sent again. The demo `DoctorSeeder` publishes through the outbox too. See
+[ADR-008](docs/adr/ADR-008-transactional-outbox.md).
+
+**Consumer idempotency (implemented) and failure handling (specified, not implemented).**
+[ADR-009](docs/adr/ADR-009-consumer-idempotency-and-failure-handling.md) is `Accepted`. Its deduplication part
+exists: `notification-service` stores the event id under a unique index (`ux_notification_event_id`) and
+`NotificationService.record` ignores a violation of that index, so a redelivered `appointment.booked`,
+`appointment.cancelled` or `appointment.changed` is stored once. The `appointment-service` read-model consumers are
+idempotent because they upsert by id, which redelivery tests pin. The rest of ADR-009 does not exist in the code yet:
+`ErrorHandlingDeserializer`, retry classification and a dead-letter topic. No consumer has a retry policy or
+dead-letter topic configured.
+
+---
+
+## Architecture Decisions (ADRs)
+
+Documented in [`docs/adr/`](docs/adr/):
+
+* [ADR-001](docs/adr/ADR-001-microservices-vs-monolith.md) — Microservices vs Modular Monolith
+* [ADR-002](docs/adr/ADR-002-kafka-as-event-broker.md) — Kafka as Event Broker
+* [ADR-003](docs/adr/ADR-003-db-per-service.md) — Database per Service
+* [ADR-004](docs/adr/ADR-004-JWT-Authentication.md) — JWT Authentication (RS256, hybrid validation, token-derived
+  identity)
+* [ADR-005](docs/adr/ADR-005-cross-service-validation.md) — Cross-Service Validation via event-driven read-model
+* [ADR-006](docs/adr/ADR-006-service-discovery.md) — Static Service discovery
+* [ADR-007](docs/adr/ADR-007-correlation-id-propagation.md) — Correlation ID Propagation for Log Correlation
+* [ADR-008](docs/adr/ADR-008-transactional-outbox.md) — Transactional Outbox for Domain Event Publishing
+* [ADR-009](docs/adr/ADR-009-consumer-idempotency-and-failure-handling.md) — Consumer Idempotency and Failure Handling
+  (deduplication implemented; failure handling and dead-lettering specified, not implemented)
+
+* Each ADR includes context, alternatives, trade-offs, and rationale.
+
+---
+
+## Failure and Edge Behavior
+
+| Scenario                                           | Behavior                                                                                |
+|----------------------------------------------------|-----------------------------------------------------------------------------------------|
+| Notification Service down                          | Kafka retains the event; consumer resumes from last offset on restart, no data loss     |
+| Concurrent double-booking                          | Rejected atomically by the partial unique index, returned as `409`                      |
+| Booking outside opening hours, off the slot grid, or in the past | Rejected with `400` (a slot starting exactly now is accepted) |
+| Booking for an unknown patient/doctor              | Rejected with `404` (validated against the read-model)                                  |
+| Cancelling another patient's appointment           | Rejected with `403`; no state change                                                    |
+| Appointment not found on cancel                    | `404` problem+json; no partial state change                                             |
+| Cancelling an already-cancelled appointment        | `200` with the current state; no new event                                              |
+| Cancel while the appointment row is locked > 3s    | `503` problem+json (`Appointment Busy`) with `Retry-After: 1`; safe to retry            |
+| Changing an appointment that starts in < 48h       | `409` problem+json (`Change Window Closed`); no state change                            |
+| Changing a cancelled appointment                   | `409` problem+json (`Appointment Not Changeable`); no state change                      |
+| Changing to a taken slot                           | `409` (`Slot Already Booked`); the appointment keeps its old time                       |
+| Changing to a time outside opening hours, off the grid or in the past | `400`; the appointment keeps its old time                    |
+| Changing another patient's appointment             | Rejected with `403`; no state change                                                    |
+| Change while the appointment row is locked > 3s    | `503` problem+json (`Appointment Busy`) with `Retry-After: 1`; safe to retry            |
+| Duplicate username/email                           | `409` problem+json                                                                      |
+| Kafka downtime                                     | Booking, changing, cancellation and registration still succeed; the event waits in the outbox and the relay publishes it when Kafka returns (see Reliability). Until then, a newly registered patient or doctor is unknown to appointment-service (booking returns `404`) and no notification is recorded |
+| Duplicate event delivery                           | Read-model consumers upsert; notification-service stores each event id once (unique index); event versioning is Phase 3 |
+
+---
+
+## Current Limitations (Intentional)
+
+* **Doctor onboarding trust** is intentionally shallow so far. Self-registration (`POST /api/doctors/register`) is
+  public and issues a DOCTOR token immediately: it proves someone can create an account, not that they are a verified
+  provider. Production would gate provider visibility and trust behind credential verification (for example, an
+  Arztekammer number) and identity checks in a proper onboarding flow; that distinction, and closing it, is Phase 3
+  work that has not started (see Project Phases). Admin-provisioned doctor accounts are deferred, as YAGNI at the current
+  scale. Browsing (`GET`)
+  stays public by design.
+* **Refresh tokens** are not implemented; access tokens are valid for one hour.
+* **The 48-hour change rule in the UI assumes one region.** The frontend decides whether to open the change form from
+  a constant (`CHANGE_MIN_NOTICE_HOURS`, to be kept in sync with `appointment.change.min-notice-hours`) and compares the
+  appointment's zone-less local date-time with the browser's clock, so it assumes the browser and appointment-service
+  are in the same time zone; the server's `409 Change Window Closed` stays the authority but never sees a change the UI
+  blocked. Planned fix if the application becomes multi-region: the server returns a `changeableUntil` field on appointment
+  responses, an absolute UTC timestamp computed from its clock and the property, and the UI only compares it with the
+  current time. That removes both the constant and the time-zone assumption (additive API change, so it needs approval).
+* **Service discovery** is static per [ADR-006](docs/adr/ADR-006-service-discovery.md); Eureka/Consul is Phase 3 work
+  that has not started.
+* **Reliability/observability**: correlation-ID propagation and structured logging are implemented across all
+  services and the gateway (see Observability above), and event publishing goes through the transactional outbox
+  (see Reliability above). Distributed tracing, metrics, consumer failure handling (poison-pill handling, retries and
+  the dead-letter topic of [ADR-009](docs/adr/ADR-009-consumer-idempotency-and-failure-handling.md)), and event
+  versioning are still Phase 3.
+
+---
+
+## Project Phases
+
+### Phase 1 — Architecture Sandbox (complete)
+
+Service decomposition · Kafka-based events · database-per-service · API Gateway · unit tests
+
+### Phase 2 — Domain Modeling (complete)
+
+Patient auth (JWT RS256) · Doctor profiles, specialties, language filtering · availability/slot computation · race-safe
+booking (partial unique index) · soft-delete cancellation · cross-service validation via event-driven read-model ·
+per-service JWT validation with token-derived identity and ownership checks · RFC 9457 error handling across services ·
+gateway routing for all services · Testcontainers integration coverage (concurrency-verified booking, cross-service JWT
+rejection, read-model projection, ownership enforcement)
+
+### Phase 3: Production & Intelligence Layer (in progress)
+
+Done:
+
+* Correlation-ID propagation and structured logging (see Observability)
+* Transactional outbox (see Reliability)
+* Notification deduplication by event id (see Reliability)
+* Gateway-level JWT edge validation (see Authentication and Authorization)
+
+Specified, not implemented:
+
+* Consumer failure handling: poison pills, retries and a dead-letter topic
+  ([ADR-009](docs/adr/ADR-009-consumer-idempotency-and-failure-handling.md))
+
+Not started:
+
+* Metrics and distributed tracing
+* Event versioning
+* Service discovery (static per [ADR-006](docs/adr/ADR-006-service-discovery.md))
+* Doctor credential verification and a proper onboarding flow (see Current Limitations)
+* AI-assisted symptom-to-specialty triage
+
+---
+
+## Testing
+
+Each service is tested at three layers, isolating a different concern at each level: unit tests for business logic,
+slice tests for the web/security contract, and integration tests for what only a real database, Kafka broker, and
+full Spring context can catch.
+
+### Unit tests
+
+Plain Mockito tests against a single class, no Spring context, no I/O. These cover business logic and edge cases in
+isolation: `AppointmentServiceTest`, `AvailabilityServiceTest`, `SlotPolicyTest`, `BookingRulesTest`, `ValidDoctorTest`,
+`DoctorServiceTest`, `SpecialtyServiceTest`, `DoctorSpecificationsTest`, `SpecialtySeederTest`, `AuthServiceTest`,
+`PatientServiceTest`, `JwtTokenProviderTest`, `NotificationServiceTest`, `OutboxEventWriterTest` (one per publishing
+service), `ConsumerCorrelationTest` (appointment and notification services), and `AppointmentEventConsumerTest` (the
+Kafka listener method tested with a mocked service dependency).
+
+### Slice tests
+
+`@WebMvcTest` tests (`AppointmentControllerTest`, `AvailabilityControllerTest`, `DoctorControllerTest`,
+`SpecialtyControllerTest`, `PatientControllerTest`) load only the web layer: the controller, validation, and the
+real Spring Security authorization rules, with the service layer mocked. Each service's `SecurityConfig` holds only
+those authorization rules; the `JwtDecoder` bean (the thing that actually needs a real key) lives in a separate
+`JwtDecoderConfig`. A slice test imports `SecurityConfig` to get the real permitAll/authenticated rules, then
+supplies its own `@MockitoBean JwtDecoder`, so `JwtDecoderConfig` and the `RsaKeyProperties` binding behind it are
+never loaded. These tests pass in a clean checkout with no `keys/` directory present at all, and run in milliseconds
+since there's no database or broker involved.
+
+### Integration tests (Testcontainers)
+
+Four services have full application-context integration tests backed by Testcontainers instead of mocks, exercising
+real persistence, real RS256 signature validation, and in some cases a real Kafka broker:
+
+* `patient-service` (`AuthIntegrationTest`): registration and duplicate-username/email conflict flows against a real
+  Postgres container and a real Kafka container. The test consumes `patient.registered` from the broker and asserts
+  the key, payload and `X-Correlation-Id` header, so it covers the outbox relay end to end.
+* `doctor-service` (`DoctorIntegrationTest`): the same pattern for `doctor.registered`, plus opening-hours validation
+  and login, against real Postgres and Kafka containers. It calls only public endpoints (register, login,
+  browsing), so it sends no token.
+* `appointment-service` (`AppointmentIntegrationTest`, `AppointmentChangeIntegrationTest`,
+  `AvailabilityIntegrationTest`): booking, cancellation, changing (including a change racing a cancel and concurrent
+  moves to one slot), ownership checks, and availability against a real Postgres container. All three extend
+  `AbstractAppointmentApiTest`, which mints JWTs with a throwaway RSA key pair generated inside the test, so they never
+  read `keys/private.pem`. There is no Kafka in these tests: the relay's poll delay is pushed out to an hour.
+  `ReadModelProjectionIntegrationTest` instead runs a real `ConfluentKafkaContainer`
+  alongside Postgres, publishes real `patient.registered`/`doctor.registered` events, and asserts the read-model
+  consumer projects them correctly, exercising the actual Kafka listener rather than a mock.
+* Outbox tests (`outbox/` in patient-, doctor- and appointment-service, one adapted copy each):
+  `OutboxAtomicityIntegrationTest` (real Postgres: a successful write adds exactly one unpublished outbox row, a
+  rolled-back write adds none, for booking, cancelling and changing in appointment-service), `OutboxRelayIntegrationTest` (real Postgres and Kafka: the correlation id is
+  re-attached from the stored column, concurrent relays publish each row exactly once, and `claimBatch` does not
+  block on rows another transaction has locked), `OutboxRelayKafkaOutageIntegrationTest` (pauses the Kafka container:
+  the request still returns `201` and leaves an unpublished row, and the row is published once Kafka is back), and
+  `OutboxPruningJobTest` (only published rows past retention are deleted).
+* `notification-service` (`NotificationConsumerIntegrationTest`): the same real-Kafka-container approach, publishing
+  a real `appointment.booked` or `appointment.changed` event and asserting a notification row gets persisted (and that a
+  redelivered event is stored once), verifying the consumer wiring end to end. `NotificationSchemaUpgradeIntegrationTest`
+  starts the service on a notification table created by an earlier version and checks the startup schema script.
+
+The `*ApplicationTests` smoke tests (`PatientServiceApplicationTests`, `DoctorServiceApplicationTests`,
+`AppointmentServiceApplicationTests`) also load the full application, including `JwtDecoderConfig`, and each starts
+its own Testcontainers Postgres, so they no longer silently depend on a manually-run `docker compose` stack being up.
+They read from the same `keys/` directory described in JWT Keys below, the one and only key location in this repo;
+a real deployment never uses this location either, since it overrides `JWT_PRIVATE_KEY_PATH`/`JWT_PUBLIC_KEY_PATH`
+to point at a mounted secret instead (see the Docker Compose table below).
+
+---
+
+## Local Setup
+
+### Requirements
+
+* Docker and Docker Compose v2 (primary; runs the whole system, from prebuilt images or built from source). Building
+  from source needs BuildKit (the default since Docker 23); the Dockerfiles cache the Maven repository with `RUN --mount=type=cache`
+* Java 21 and Maven 3.9+ (optional; only to run a service on the host or to build the images yourself)
+* `openssl` (to generate the JWT key pair, see Step 2)
+* `curl` and `jq` (for the test script)
+
+### Step 1 — Clone the Repository
+
+```bash
+git clone https://github.com/ysfwrda/healthtech-booking.git
+cd healthtech-booking
+```
+
+The repository supplies `docker-compose.yml`, the committed public key, and the scripts. Step 3 builds the service images
+from this checkout or, optionally, pulls prebuilt ones.
+
+### Step 2 — JWT Keys
+
+The RSA key pair used to sign and validate tokens lives at the repo root, outside every service's resources, so there
+is a single source of truth instead of copies baked into each service jar:
+
+```
+keys/
+  private.pem   (gitignored, never committed)
+  public.pem    (committed for clone-and-run convenience)
+```
+
+Patient Service signs tokens with the private key. Appointment Service and the API Gateway validate tokens with the
+public key; neither holds the private key and neither can mint tokens.
+
+Generate your own matching pair (this overwrites the committed `keys/public.pem` locally with one that matches your
+freshly generated private key; that is expected, since a private key generated on your machine can only ever be
+verified by the public key derived from it):
+
+```bash
+mkdir -p keys
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out keys/private.pem
+openssl rsa -in keys/private.pem -pubout -out keys/public.pem
+```
+
+`keys/private.pem` is gitignored and must be generated locally; in a real deployment it would be injected via a secret
+manager instead. If `keys/public.pem` ever drifts from the private key actually in use (for example, a stale commit
+without regenerating it locally), token verification fails closed with a signature error, not a silent bypass.
+
+Each service reads its key path from an environment variable with a local-host default, matching the existing
+`${VAR:default}` pattern used for database and Kafka settings elsewhere in this project:
+
+| Service             | Env var                                       | Default (host)                                        |
+|---------------------|-----------------------------------------------|-------------------------------------------------------|
+| patient-service     | `JWT_PRIVATE_KEY_PATH`, `JWT_PUBLIC_KEY_PATH` | `file:../keys/private.pem`, `file:../keys/public.pem` |
+| doctor-service      | `JWT_PRIVATE_KEY_PATH`, `JWT_PUBLIC_KEY_PATH` | `file:../keys/private.pem`, `file:../keys/public.pem` |
+| appointment-service | `JWT_PUBLIC_KEY_PATH`                         | `file:../keys/public.pem`                             |
+
+The host defaults assume the process runs from within its own module directory (`cd patient-service && mvn
+spring-boot:run`, matching Step 3 below), so `../keys/` resolves to the repo-root `keys/` directory. Under Docker
+Compose, `./keys` is mounted read-only into each container at `/run/keys` and the env vars are set to
+`file:/run/keys/...` accordingly.
+
+Note: doctor-service now issues DOCTOR tokens too (self-registration and login), signing with the same shared private
+key patient-service uses for PATIENT tokens, per [ADR-004](docs/adr/ADR-004-JWT-Authentication.md). Doctor
+registration is public by design; there is no admin/doctor role check gating who can register (see Current
+Limitations). Browsing and specialty reads stay public.
+The API Gateway validates tokens at the edge (signature and expiry only) with the shared public key, see the
+Authentication section below and ADR-004.
+
+### Step 3 — Start the Services
+
+All services are containerized. There are two ways to run the whole system (infrastructure plus all five services);
+make sure the keys from Step 2 exist first.
+
+**Option A: build from your working tree (default, for development).** Compose builds each service image from the
+current code:
+
+```bash
+docker compose up -d --build
+```
+
+**Option B: run the prebuilt images (no local build).** CI publishes an image for each service to the GitHub Container
+Registry (`ghcr.io/ysfwrda/<service>:latest`, built from `main` after the tests pass). The images are public, so no
+login is needed. They are enabled by layering the `docker-compose.images.yml` override on top of the base file:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.images.yml pull
+docker compose -f docker-compose.yml -f docker-compose.images.yml up -d
+```
+
+To avoid typing the file list each time, set `export COMPOSE_FILE=docker-compose.yml:docker-compose.images.yml`, after
+which plain `docker compose pull` and `docker compose up -d` use the images.
+
+Both options start the services alongside Kafka, Zookeeper, Kafka UI (`http://localhost:8090`), and the four PostgreSQL
+instances, all on a shared Docker network. The services connect to Kafka and their databases by container name. The
+images contain no keys; `./keys` is mounted into the containers at runtime (see Step 2).
+
+**Startup order and recovery.** Each container has a healthcheck, and a service starts only once its dependencies are
+healthy: Zookeeper, then Kafka and the databases, then the three backend services, then the gateway, then the frontend.
+A cold start takes a minute or two. If one of the appointment, patient or doctor services fails to become healthy, the
+gateway and frontend are deliberately not started and `docker compose up -d` exits with an error; look at
+`docker compose ps` and `docker compose logs <service>`. Zookeeper, Kafka and the PostgreSQL containers restart
+automatically after a crash or a reboot of Docker, but the application services do not: after a reboot, run
+`docker compose up -d` again to bring the whole stack back.
+
+Option B reads two optional environment variables:
+
+| Variable         | Default           | Use                                                          |
+|------------------|-------------------|--------------------------------------------------------------|
+| `IMAGE_TAG`      | `latest`          | Pin a published build by its full 40-character commit SHA   |
+| `IMAGE_REGISTRY` | `ghcr.io/ysfwrda` | Pull from a fork's registry, e.g. `ghcr.io/<your-user>`     |
+
+Note that Option B runs the code published from `main`, not your working tree; use Option A to test local changes.
+Without the override file, the images are never pulled and `docker compose up -d --build` always builds from source.
+
+To run a single service on the host against the infrastructure for development, start only the infrastructure and run
+the service with Maven (it falls back to `localhost` addresses by default):
+
+```bash
+docker compose up -d zookeeper kafka postgres-appointment postgres-notification postgres-patient postgres-doctor
+cd appointment-service && mvn spring-boot:run
+```
+
+If the pull in Option B is denied (for example, a fork whose packages are private), run `docker login ghcr.io` with a
+GitHub token that has `read:packages`, or use Option A.
+
+### Step 4 — Exercise the Flow
+
+Convenience path: run the full pipeline in one command (requires `curl` and `jq`):
+
+```bash
+bash scripts/test-flow.sh
+```
+
+It registers a patient and doctor, reads availability, books a slot, confirms the slot disappears, rejects a
+double-booking, changes the appointment (purpose and time), confirms the old slot is free and the new one taken,
+rejects an empty change, cancels, and confirms the slot reappears.
+
+The individual calls (all through the gateway at `8080`) below show the API contract.
+
+Register a patient (returns a JWT):
+
+```bash
+curl -X POST http://localhost:8080/api/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{
+    "firstName": "John", "lastName": "Doe",
+    "username": "john.doe", "password": "secret123",
+    "dateOfBirth": "1990-01-01",
+    "email": "john.doe@example.com",
+    "insuranceType": "PRIVATE"
+  }'
+```
+
+The password must be 8 to 72 characters; anything else returns `400` with a `password` field error. Doctor
+registration requires at least 8 characters.
+
+Register a doctor (public, no token required; issues a DOCTOR JWT immediately, see Current Limitations for what that
+does and doesn't vouch for):
+
+```bash
+# 1. Get specialties
+curl http://localhost:8080/api/specialties
+
+# 2. Register a doctor (replace <specialty-id> with an id from step 1)
+curl -X POST http://localhost:8080/api/doctors/register \
+  -H "Content-Type: application/json" \
+  -d '{
+    "firstName": "Jane", "lastName": "Smith",
+    "email": "jane@clinic.com",
+    "password": "secret123",
+    "phoneNumber": "+49 30 1234567",
+    "address": { "street": "Friedrichstrasse", "houseNumber": "12", "postalCode": "10117", "city": "Berlin", "country": "Germany" },
+    "specialtyIds": ["<specialty-id>"],
+    "openingHours": [ { "dayOfWeek": "MONDAY", "startTime": "09:00", "endTime": "17:00" } ],
+    "languages": ["ENGLISH"]
+  }'
+```
+
+Doctor login (returns a fresh DOCTOR JWT for an already-registered doctor, including any of the seeded demo doctors
+below):
+
+```bash
+curl -X POST http://localhost:8080/api/doctors/login \
+  -H "Content-Type: application/json" \
+  -d '{ "email": "jane@clinic.com", "password": "secret123" }'
+```
+
+Check a doctor's available slots (use a date whose weekday matches the opening hours; public, no token):
+
+```bash
+curl "http://localhost:8080/api/availability?doctorId=<doctor-id>&date=2026-07-13"
+```
+
+Book an appointment (requires the patient token from register/login; the patient id is taken from the token, not the
+body):
+
+```bash
+curl -X POST http://localhost:8080/api/appointments \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <token>" \
+  -d '{
+    "doctorId": "<doctor-id>",
+    "dateTime": "2026-07-13T10:00:00",
+    "type": "INITIAL_CONSULTATION",
+    "notes": "First visit, general checkup"
+  }'
+```
+
+Change an appointment's purpose and/or time (requires the owning patient's token, at least 48 hours before it
+starts; send only the fields to change):
+
+```bash
+curl -X PATCH http://localhost:8080/api/appointments/<appointment-id> \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{ "dateTime": "2026-07-13T11:00:00", "type": "FOLLOW_UP" }'
+```
+
+Cancel an appointment (requires the owning patient's token):
+
+```bash
+curl -X PUT http://localhost:8080/api/appointments/<appointment-id>/cancel \
+  -H "Authorization: Bearer <token>"
+```
+
+Re-check availability after booking, changing or cancelling to see the slots disappear and reappear.
+
+Prefer a browser? The same endpoints can be explored interactively in Swagger UI, see
+[API Documentation (Swagger UI)](#api-documentation-swagger-ui) below. This walkthrough remains the reference for the
+end-to-end flow (register, search, book, change, cancel, event verification).
+
+### API Documentation (Swagger UI)
+
+Every REST service publishes an OpenAPI 3 spec and an interactive Swagger UI (springdoc-openapi). The API Gateway
+serves one aggregated UI covering all three APIs.
+
+| UI                                           | URL                                      | OpenAPI JSON                                  |
+|----------------------------------------------|------------------------------------------|-----------------------------------------------|
+| **Gateway (all services, recommended)**      | http://localhost:8080/swagger-ui.html    | `/docs/{appointment,patient,doctor}/v3/api-docs` |
+| Appointment Service (direct)                 | http://localhost:8081/swagger-ui.html    | http://localhost:8081/v3/api-docs             |
+| Patient Service (direct)                     | http://localhost:8083/swagger-ui.html    | http://localhost:8083/v3/api-docs             |
+| Doctor Service (direct)                      | http://localhost:8084/swagger-ui.html    | http://localhost:8084/v3/api-docs             |
+
+On the gateway UI, pick a service from the **Select a definition** dropdown in the top-right corner.
+
+**Calling protected endpoints from the UI:**
+
+1. Obtain a token with `POST /api/auth/login` (patient) or `POST /api/doctors/login` (doctor) via "Try it out", or with
+   curl as shown above.
+2. Click **Authorize**, paste the token (without the `Bearer ` prefix), and confirm.
+3. Run any protected operation, e.g. `GET /api/appointments`. Role rules are still enforced by each service.
+
+The docs endpoints are public (no token needed to view them). To disable them, e.g. in production, set
+`SWAGGER_ENABLED=false` on the service and/or the gateway. If "Try it out" sends requests to the wrong host, set
+`OPENAPI_SERVER_URL` on the services to the gateway URL, e.g. `http://localhost:8080`.
+
+### Demo Data (Seeded)
+
+`DoctorSeeder` runs at doctor-service startup (after `SpecialtySeeder`, which it depends on) and seeds six demo
+doctors, idempotently (skipped on restart if the email already exists). Each covers multiple specialties and
+languages, with opening hours across several weekdays, so filtering and availability have realistic overlap to
+explore. Each publishes `doctor.registered` through the transactional outbox on creation, same as a real
+self-registration, so they're bookable through the normal flow as soon as the relay has published the event. If Kafka
+isn't reachable yet when the seeder runs, the events wait in the outbox and are published once it is.
+
+All seeded doctors share one password: **`demo12345`**. Log in as any of them via `POST /api/doctors/login`:
+
+| Email                                 | Specialties                         | Languages                |
+|---------------------------------------|-------------------------------------|--------------------------|
+| `anna.weber@demo.healthtech.com`      | General Practice, Cardiology        | German, English          |
+| `mehmet.yilmaz@demo.healthtech.com`   | Cardiology, Orthopedics             | Turkish, German          |
+| `sophie.dubois@demo.healthtech.com`   | Dermatology, Gynecology             | French, English          |
+| `elena.rossi@demo.healthtech.com`     | Pediatrics, Dermatology, Gynecology | Italian, Spanish         |
+| `omar.haddad@demo.healthtech.com`     | Neurology, General Practice         | Arabic, Persian, English |
+| `katarina.petrov@demo.healthtech.com` | Orthopedics, Neurology, Pediatrics  | Russian, English         |
+
+```bash
+curl -X POST http://localhost:8080/api/doctors/login \
+  -H "Content-Type: application/json" \
+  -d '{ "email": "anna.weber@demo.healthtech.com", "password": "demo12345" }'
+```
+
+### Step 5 — Verify the Event Flow
+
+* Kafka UI (`http://localhost:8090`): confirm `patient.registered`, `doctor.registered`, `appointment.booked`,
+  `appointment.cancelled` and `appointment.changed` have messages.
+* Appointment Service: confirm `valid_patient` / `valid_doctor` rows appear in `appointment_db` (the read-model).
+* Notification Service: confirm the booking event was consumed and a notification record was saved in `notification_db`.
+
+### Step 6 — Run the Frontend
+
+The frontend is a React (Vite, TypeScript) client that talks to every service exclusively through the API Gateway.
+It is built and served by nginx as the `frontend` service in `docker-compose.yml`, so `docker compose up -d --build`
+already starts it at `http://localhost:5173`. `VITE_API_BASE` is baked in at image build time (build arg, default
+`http://localhost:8080`). To run on another host, set `FRONTEND_URL` (gateway CORS origin) and `VITE_API_BASE` in your
+environment or a root `.env` before `docker compose up -d --build`. For hot reload, run it on the host instead against the Compose stack from Step 3:
+
+```bash
+cd frontend
+cp .env.example .env.local   # VITE_API_BASE=http://localhost:8080, points at the gateway
+npm install
+npm run dev
+```
+
+The dev server also opens at `http://localhost:5173` (stop the container first to free the port). Covers both patient and doctor self-service flows end to end: patient
+register/login, doctor search with specialty/language filters, doctor detail with formatted opening hours and
+live availability, appointment booking, changing (purpose and time) and cancellation, and doctor register/login (`/doctors/register`,
+`/doctors/login`), mirroring the API described in Step 4.
+
+---
+
+## Project Structure
+
+```
+healthtech-booking/
+├── api-gateway/
+├── appointment-service/
+├── notification-service/
+├── patient-service/
+├── doctor-service/
+├── frontend/
+├── infrastructure/
+├── keys/
+├── scripts/
+│   └── test-flow.sh
+├── docs/
+│   ├── adr/
+│   └── architecture/
+└── docker-compose.yml
+```
+
+---
+
+## Infrastructure Ports
+
+| Resource             | Host Port | Notes                      |
+|----------------------|-----------|----------------------------|
+| Kafka                | 9092      | PLAINTEXT (host access)    |
+| Kafka UI             | 8090      | Browse topics and messages |
+| Swagger UI (gateway) | 8080      | `/swagger-ui.html`, all APIs |
+| PostgreSQL (appt)    | 5432      | `appointment_db`           |
+| PostgreSQL (notif)   | 5433      | `notification_db`          |
+| PostgreSQL (patient) | 5434      | `patient_db`               |
+| PostgreSQL (doctor)  | 5435      | `doctor_db`                |
+
+---
+
+## License
+
+MIT

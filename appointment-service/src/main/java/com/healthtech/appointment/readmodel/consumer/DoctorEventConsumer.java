@@ -1,0 +1,63 @@
+package com.healthtech.appointment.readmodel.consumer;
+
+import com.healthtech.appointment.event.DoctorRegistered;
+import com.healthtech.appointment.event.OpeningHoursPayload;
+import com.healthtech.appointment.correlation.ConsumerCorrelation;
+import com.healthtech.appointment.correlation.CorrelationId;
+import com.healthtech.appointment.readmodel.OpeningHours;
+import com.healthtech.appointment.readmodel.ValidDoctor;
+import com.healthtech.appointment.readmodel.ValidDoctorRepository;
+import lombok.RequiredArgsConstructor;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.kafka.annotation.KafkaListener;
+import org.springframework.messaging.handler.annotation.Header;
+import org.springframework.stereotype.Component;
+
+import java.util.Set;
+import java.util.stream.Collectors;
+
+@Component
+@RequiredArgsConstructor
+public class DoctorEventConsumer {
+    private static final Logger log = LoggerFactory.getLogger(DoctorEventConsumer.class);
+
+    private final ValidDoctorRepository validDoctorRepository;
+
+    @KafkaListener(
+            topics = "doctor.registered",
+            containerFactory = "doctorRegisteredKafkaListenerFactory"
+    )
+    public void onDoctorRegistered(
+            DoctorRegistered event,
+            @Header(value = CorrelationId.HEADER, required = false) byte[] correlationIdHeader) {
+        ConsumerCorrelation.runWith(correlationIdHeader, () -> {
+            try {
+                Set<OpeningHours> openingHours = event.getOpeningHours() == null ? Set.of() :
+                        event.getOpeningHours().stream()
+                                .map(this::toOpeningHours)
+                                .collect(Collectors.toSet());
+
+                ValidDoctor doctor = ValidDoctor.builder()
+                        .doctorId(event.getDoctorId())
+                        .firstName(event.getFirstName())
+                        .lastName(event.getLastName())
+                        .openingHours(openingHours)
+                        .build();
+                validDoctorRepository.save(doctor);
+                log.info("Projected doctor read-model, doctorId {}", event.getDoctorId());
+            } catch (RuntimeException e) {
+                log.error("Failed to project doctor read-model, doctorId {}", event.getDoctorId(), e);
+                throw e;
+            }
+        });
+    }
+
+    private OpeningHours toOpeningHours(OpeningHoursPayload payload) {
+        return OpeningHours.builder()
+                .dayOfWeek(payload.getDayOfWeek())
+                .startTime(payload.getStartTime())
+                .endTime(payload.getEndTime())
+                .build();
+    }
+}

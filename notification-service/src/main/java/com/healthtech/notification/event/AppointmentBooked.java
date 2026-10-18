@@ -1,0 +1,35 @@
+package com.healthtech.notification.event;
+
+import com.healthtech.notification.domain.NotificationType;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Getter;
+import lombok.NoArgsConstructor;
+import lombok.Setter;
+
+import java.time.LocalDateTime;
+import java.util.UUID;
+
+@Getter
+@Setter
+@NoArgsConstructor
+@AllArgsConstructor
+@Builder
+public class AppointmentBooked implements AppointmentNotificationEvent {
+    private UUID eventId;
+    private UUID appointmentId;
+    private UUID patientId;
+    private String patientName;
+    private String patientEmail;
+    private UUID doctorId;
+    private String doctorName;
+    private String type;
+    private Integer duration;
+    private LocalDateTime dateTime;
+    private LocalDateTime bookedAt;
+
+    @Override
+    public NotificationType notificationType() {
+        return NotificationType.APPOINTMENT_BOOKED;
+    }
+}

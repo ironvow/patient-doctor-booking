@@ -1,0 +1,20 @@
+spring:
+  jpa:
+    defer-datasource-initialization: true
+    dialect: org.hibernate.dialect.PostgreSQLDialect
+    hibernate:
+      ddl-auto: update
+
+  sql:
+    init:
+      mode: always
+      platform: postgresql
+  kafka:
+    bootstrap-servers: localhost:9092
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+
+app:
+  jwt:
+    public-key: ${JWT_PUBLIC_KEY_PATH:file:../keys/public.pem}
